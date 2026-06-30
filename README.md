@@ -1,11 +1,15 @@
-# ModFire — Live Modbus TCP Monitor
+# ModFire — Modbus TCP Console
 
-A single-file local web app that continuously polls a Modbus TCP device
-(Holding Registers, Function Code 03) and displays the results in your browser
-in **real time**.
+A single-file local web app for talking to Modbus TCP devices from your browser,
+with everything updating in **real time**. It wraps the original command-line
+scripts into one multi-page UI:
 
-It's the original `modpoll` polling script wrapped in a small web UI: configure
-the target, hit **Start**, and watch register values stream in live.
+- **📊 Monitor** — continuously read Holding Registers (FC03) and watch values
+  update live (the `modpoll` script).
+- **🎚 Control** — fire coils (FC05): turn ON/OFF, or **Pulse** (ON → wait → OFF),
+  plus a 16-coil quick bank (the `modfire` coil script).
+- **🛰 Scan** — discover Modbus modules: find gateways on your network (open
+  Modbus port) and probe a gateway for responding RS485 slave IDs.
 
 ## Why a Python file and not a plain `.html`?
 
@@ -25,17 +29,34 @@ Then open the URL it prints (default <http://127.0.0.1:8512>) in your browser.
 
 ## Use it
 
-1. Fill in the gateway IP, port, slave ID, starting register, register count,
-   poll interval, and timeout. Defaults match the original script
-   (`192.168.23.201:502`, slave 1, 16 registers from address 0, every 2s).
-2. Click **Start**. The status badge turns green while polling.
-3. Register values update live in the grid (changed cells flash), with running
-   counts of polls / successes / errors and a scrolling event log.
-4. Click **Stop** to end polling. Config changes apply on the next Start and are
-   remembered in your browser.
+Switch between pages with the tabs in the header.
+
+### Monitor
+1. Fill in gateway IP, port, slave ID, start register, register count, poll
+   interval, and timeout (defaults: `192.168.23.201:502`, slave 1, 16 registers
+   from address 0, every 2s).
+2. Click **Start** — values update live in the grid (changed cells flash), with
+   running poll/success/error counts and an event log. **Stop** ends it.
+
+### Control
+1. Fill in gateway IP/port/slave (default `192.168.23.200:502`, slave 1) and a
+   **Pulse** duration, then **Connect**.
+2. Fire a coil by index with **ON** / **OFF** / **⚡ Pulse**, or use the 16-coil
+   quick bank. Pulse turns the coil ON, waits, then OFF — like the original
+   script's 5-second cycle. Coil indicators light up green when ON.
+
+### Scan
+- **Find gateways** — enter a subnet (first three octets) and host range; it
+  reports every host with the Modbus port open. Click **Use** to copy a found
+  gateway into the Monitor and Control pages.
+- **Find slaves** — point at one gateway and probe a range of unit IDs; any
+  reply (data *or* a Modbus exception) proves a module is present at that ID.
 
 ## Notes
 
 - The server binds to `127.0.0.1` only (local machine). Change `HOST`/`PORT` at
   the top of `modfire_web.py` if needed.
-- Multiple browser tabs can watch the same live stream simultaneously.
+- The Python server must run on a machine that can reach the Modbus gateway
+  (the browser can't open raw TCP sockets itself).
+- Multiple browser tabs can watch the same live stream simultaneously; field
+  values are remembered in your browser.
