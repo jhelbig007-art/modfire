@@ -52,10 +52,22 @@ Switch between pages with the tabs in the header.
 - **Find slaves** — point at one gateway and probe a range of unit IDs; any
   reply (data *or* a Modbus exception) proves a module is present at that ID.
 
-For every device it finds (gateway or slave), ModFire also requests the device
-identification (Modbus **FC43 / MEI-14**) and shows the **make / model** when
-the device reports it. This is best-effort: many simple RS485 devices and some
-gateways don't implement FC43, in which case it shows "make/model not reported".
+ModFire reports the **make / model** of what it finds, using several methods in
+order (best effort):
+
+- **Modbus FC43 / MEI-14** (Read Device Identification) — works for any device,
+  gateway or slave, that implements it. Many simple devices don't.
+- For **gateways** (devices with their own IP), two extra fallbacks that don't
+  need Modbus support:
+  - **MAC address vendor (OUI)** — the manufacturer encoded in the MAC, read
+    from the local ARP table. The raw MAC is always shown.
+  - **HTTP banner** — the web-UI page title / `Server:` header, if the gateway
+    has a web interface.
+
+A downstream **RS485 slave** has no IP, MAC, or web UI, so it can only be
+identified if it supports FC43; otherwise it shows "make/model not reported".
+The MAC-vendor lookup uses a small built-in table and, if the machine has
+internet, an online OUI API — failing gracefully to just the raw MAC.
 
 ## Notes
 

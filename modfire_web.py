@@ -19,9 +19,12 @@ packages required — Python standard library only.
 """
 
 import json
+import re
 import socket
+import subprocess
 import threading
 import time
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HOST = "127.0.0.1"
@@ -206,6 +209,127 @@ def derive_make_model(devid):
     model = (devid.get("model_name") or devid.get("product_name")
              or devid.get("product_code") or "").strip()
     return make, model
+
+
+# ---------------------------------------------------------------------------
+# Out-of-band identification (for IP devices like gateways that don't do FC43):
+# resolve the manufacturer from the MAC address and grab any HTTP banner.
+# ---------------------------------------------------------------------------
+# A small seed of OUI prefixes common in Ethernet/RS485 gateways. Anything not
+# here is looked up online (best effort) and the raw MAC is always shown too.
+OUI_DB = {
+    "0008dc": "WIZnet",          # W5500 chips used by many RS485-to-ETH modules
+    "00e04c": "Realtek",
+    "001963": "Atop Technologies",
+    "0090e8": "Moxa",
+    "00c0a8": "Moxa",
+    "001b1b": "Advantech",
+    "74fe48": "Espressif",
+    "240ac4": "Espressif",
+    "30aea4": "Espressif",
+    "a4cf12": "Espressif",
+    "b827eb": "Raspberry Pi",
+    "dca632": "Raspberry Pi",
+}
+_oui_cache = {}
+_oui_lock = threading.Lock()
+
+
+def get_mac_address(ip):
+    """Return the MAC for an IP from the local ARP/neighbour table, or ''."""
+    try:
+        with open("/proc/net/arp") as f:
+            for line in f.read().splitlines()[1:]:
+                parts = line.split()
+                if len(parts) >= 4 and parts[0] == ip and parts[3] != "00:00:00:00:00:00":
+                    return parts[3].lower()
+    except Exception:
+        pass
+    for cmd in (["ip", "neigh", "show", ip], ["arp", "-n", ip]):
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=2).stdout
+            m = re.search(r"([0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5})", out)
+            if m:
+                return m.group(1).lower()
+        except Exception:
+            pass
+    return ""
+
+
+def lookup_oui_vendor(mac, allow_online=True, timeout=1.5):
+    """Resolve a MAC's manufacturer via the seed table, then an online OUI API."""
+    if not mac:
+        return ""
+    prefix = mac.replace(":", "").replace("-", "").lower()[:6]
+    if prefix in OUI_DB:
+        return OUI_DB[prefix]
+    with _oui_lock:
+        if prefix in _oui_cache:
+            return _oui_cache[prefix]
+    vendor = ""
+    if allow_online:
+        try:
+            req = urllib.request.Request("https://api.macvendors.com/" + mac,
+                                         headers={"User-Agent": "ModFire"})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                name = r.read().decode("utf-8", "replace").strip()
+                if name and "error" not in name.lower() and "<" not in name:
+                    vendor = name
+        except Exception:
+            vendor = ""
+    with _oui_lock:
+        _oui_cache[prefix] = vendor
+    return vendor
+
+
+def http_banner(ip, port=80, timeout=1.0):
+    """Best-effort: return a model hint from a device's web UI (title/Server)."""
+    s = None
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect((ip, port))
+        s.send(f"GET / HTTP/1.0\r\nHost: {ip}\r\nUser-Agent: ModFire\r\n\r\n".encode())
+        data = b""
+        while len(data) < 8192:
+            chunk = s.recv(2048)
+            if not chunk:
+                break
+            data += chunk
+        text = data.decode("latin-1", "replace")
+        title = re.search(r"(?is)<title>(.*?)</title>", text)
+        if title:
+            t = re.sub(r"\s+", " ", title.group(1)).strip()
+            if t:
+                return t
+        server = re.search(r"(?im)^Server:\s*(.+)$", text)
+        if server:
+            return server.group(1).strip()
+        return ""
+    except Exception:
+        return ""
+    finally:
+        if s:
+            try:
+                s.close()
+            except Exception:
+                pass
+
+
+def identify_ip_device(ip, modbus_port, fc43_timeout):
+    """Combine FC43, MAC/OUI and HTTP banner into (make, model, mac)."""
+    devid = {}
+    for uid in (1, 0, 255):
+        devid = read_device_identification(ip, modbus_port, uid, fc43_timeout)
+        if devid:
+            break
+    make, model = derive_make_model(devid)
+    mac = get_mac_address(ip)
+    if not make and mac:
+        make = lookup_oui_vendor(mac)
+    if not model:
+        model = http_banner(ip)
+    return make, model, mac
 
 
 # ---------------------------------------------------------------------------
@@ -570,21 +694,15 @@ class ScanManager:
                         s.close()
                     except Exception:
                         pass
-            make = model = ""
+            make = model = mac = ""
             if open_port and not self._stop_event.is_set():
-                # Try a few common unit IDs to read the device identification.
-                devid = {}
-                for uid in (1, 0, 255):
-                    devid = read_device_identification(ip, port, uid, max(timeout, 0.8))
-                    if devid:
-                        break
-                make, model = derive_make_model(devid)
+                make, model, mac = identify_ip_device(ip, port, max(timeout, 0.8))
             with lock:
                 scanned += 1
                 if open_port:
                     found += 1
                     HUB.publish({"channel": "scan", "type": "scan_found", "kind": "network",
-                                 "ip": ip, "port": port, "make": make, "model": model})
+                                 "ip": ip, "port": port, "make": make, "model": model, "mac": mac})
                 HUB.publish({"channel": "scan", "type": "scan_progress", "kind": "network",
                              "scanned": scanned, "total": total, "found": found})
 
@@ -914,9 +1032,11 @@ PAGE = r"""<!DOCTYPE html>
   .found{display:flex;flex-direction:column;gap:8px;margin-top:10px}
   .found-item{display:flex;align-items:center;gap:10px;background:var(--panel2);border:1px solid var(--line);
     border-radius:8px;padding:9px 12px;font-family:var(--mono);font-size:13px}
+  .found-item{flex-wrap:wrap}
   .found-item .ip{font-weight:700;color:var(--ok)}
   .found-item .mm{color:var(--text);font-weight:400}
   .found-item .mm .muted{color:var(--muted)}
+  .found-item .mac{flex-basis:100%;color:var(--muted);font-size:11px;margin-top:2px}
   .found-item button{margin-left:auto;padding:5px 10px;border-radius:6px;border:1px solid var(--line);
     background:var(--bg);color:var(--text);cursor:pointer;font-size:12px;font-weight:600}
   .found-item button:hover{border-color:var(--accent2)}
@@ -1055,8 +1175,9 @@ PAGE = r"""<!DOCTYPE html>
     </div>
     <div class="hint">Network scan finds hosts with the Modbus port open. Slave scan probes
       each unit ID with a read — a reply (data <i>or</i> exception) proves a module is present.
-      For each device found, ModFire also asks for its identification (FC43) and shows the
-      <b>make / model</b> when the device reports it (not all do).</div>
+      ModFire identifies the <b>make / model</b> of found <i>gateways</i> from Modbus FC43,
+      the MAC address vendor (OUI), and any web-UI banner. Downstream RS485 slaves have no
+      IP/MAC, so they can only be identified if they support FC43.</div>
   </section>
   <section>
     <div class="panel">
@@ -1197,13 +1318,14 @@ function mmText(make, model){
   const m=[make,model].map(x=>(x||"").trim()).filter(Boolean).join(" · ");
   return m ? esc(m) : '<span class="muted">make/model not reported</span>';
 }
-function addFoundHost(ip, port, make, model){
+function addFoundHost(ip, port, make, model, mac){
   const box=$("s_net_found");
   if(box.dataset.has!=="1"){ box.innerHTML=""; box.dataset.has="1"; }
   const d=document.createElement("div"); d.className="found-item";
   d.innerHTML='<span class="ip">'+esc(ip)+'</span><span style="color:var(--muted)">:'+port+'</span>'+
     '<span class="mm">'+mmText(make,model)+'</span>'+
-    '<button onclick="useGateway(\''+esc(ip)+'\')">Use</button>';
+    '<button onclick="useGateway(\''+esc(ip)+'\')">Use</button>'+
+    (mac?'<span class="mac">MAC '+esc(mac)+'</span>':"");
   box.appendChild(d);
 }
 function addSlave(slave, status, detail, make, model){
@@ -1236,7 +1358,7 @@ function handle(ev){
     if(ev.type==="scan_status"){ updateBadge("scan",ev.state,ev.message); scanRunning(ev.state==="running");
       const p=ev.kind==="device"?"s_dev_prog":"s_net_prog"; $(p).textContent=ev.message; }
     else if(ev.type==="log") addLog("s_log",ev.level||"info",ev.message,ev.ts);
-    else if(ev.type==="scan_found") addFoundHost(ev.ip, ev.port, ev.make, ev.model);
+    else if(ev.type==="scan_found") addFoundHost(ev.ip, ev.port, ev.make, ev.model, ev.mac);
     else if(ev.type==="scan_device") addSlave(ev.slave, ev.status, ev.detail, ev.make, ev.model);
     else if(ev.type==="scan_progress"){
       const pct=ev.total?Math.round(ev.scanned/ev.total*100):0;
