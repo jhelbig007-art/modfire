@@ -19,6 +19,7 @@ packages required — Python standard library only.
 """
 
 import json
+import platform
 import re
 import socket
 import subprocess
@@ -27,8 +28,13 @@ import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-HOST = "127.0.0.1"
+# Bind to all interfaces so the page is reachable from other devices on the LAN
+# (e.g. a tablet or another PC). Set to "127.0.0.1" to restrict to this machine.
+HOST = "0.0.0.0"
 PORT = 8512
+
+# Filled in at startup with this PC's reachable IP addresses (for display).
+SERVER_INFO = {"ips": [], "port": PORT}
 
 # --- Default configuration (matches the original modpoll/modfire scripts) ---
 MONITOR_DEFAULTS = {
@@ -858,6 +864,7 @@ class Handler(BaseHTTPRequestHandler):
                 "monitor": dict(MONITOR_DEFAULTS, running=MANAGER.is_running()),
                 "control": dict(CONTROL_DEFAULTS, connected=CONTROL.is_connected()),
                 "scan": dict(SCAN_DEFAULTS, running=SCAN.is_running()),
+                "server": {"ips": SERVER_INFO["ips"], "port": PORT},
             })
         elif self.path == "/stream":
             self._stream()
@@ -969,7 +976,10 @@ PAGE = r"""<!DOCTYPE html>
   nav button{padding:7px 14px;border-radius:8px;border:1px solid var(--line);
     background:var(--panel);color:var(--muted);cursor:pointer;font-size:14px;font-weight:600}
   nav button.active{background:var(--accent);border-color:var(--accent);color:#fff}
-  .badge{margin-left:auto;display:flex;align-items:center;gap:8px;font-size:13px;
+  .srv{margin-left:auto;font-size:12px;color:var(--muted);font-family:var(--mono);
+    padding:5px 10px;border:1px solid var(--line);border-radius:8px;background:var(--panel)}
+  .srv b{color:var(--accent2);font-weight:600}
+  .badge{margin-left:14px;display:flex;align-items:center;gap:8px;font-size:13px;
     padding:6px 12px;border-radius:999px;border:1px solid var(--line);background:var(--panel)}
   .dot{width:10px;height:10px;border-radius:50%;background:var(--muted)}
   .dot.idle{background:var(--muted)} .dot.connecting{background:var(--warn);animation:pulse 1s infinite}
@@ -1059,6 +1069,7 @@ PAGE = r"""<!DOCTYPE html>
     <button data-page="control" onclick="showPage('control')">🎚 Control</button>
     <button data-page="scan" onclick="showPage('scan')">🛰 Scan</button>
   </nav>
+  <span class="srv" id="serverInfo" title="This PC's address — browse here from other devices">🖥 —</span>
   <div class="badge"><span id="dot" class="dot idle"></span><span id="stateLbl">Idle</span></div>
 </header>
 
@@ -1392,7 +1403,14 @@ window.addEventListener("load", async ()=>{
   buildBank();
   // 1) server defaults
   let cfg=null; try{ cfg=await (await fetch("/config")).json(); }catch(e){}
-  if(cfg){ fill("m_",M,cfg.monitor); fill("c_",C,cfg.control); fill("s_",S,cfg.scan); }
+  if(cfg){ fill("m_",M,cfg.monitor); fill("c_",C,cfg.control); fill("s_",S,cfg.scan);
+    if(cfg.server){
+      const ips=cfg.server.ips||[], port=cfg.server.port;
+      if(ips.length) $("serverInfo").innerHTML="🖥 This PC: <b>"+esc(ips[0])+":"+port+"</b>";
+      else $("serverInfo").innerHTML="🖥 This PC: <b>localhost:"+port+"</b>";
+      if(ips.length>1) $("serverInfo").title="Also reachable at: "+ips.slice(1).map(i=>i+":"+port).join(", ");
+    }
+  }
   // 2) saved overrides
   try{ const saved=JSON.parse(localStorage.getItem("modfire")||"{}");
     if(saved.m) fill("m_",M,saved.m); if(saved.c) fill("c_",C,saved.c); if(saved.s) fill("s_",S,saved.s); }catch(e){}
@@ -1410,15 +1428,91 @@ window.addEventListener("load", async ()=>{
 """
 
 
+def get_local_ips():
+    """Return this PC's LAN IPv4 address(es), best guess first."""
+    ips = []
+    # The address used to reach the outside world is usually the primary LAN IP.
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(0.5)
+        s.connect(("8.8.8.8", 80))
+        ips.append(s.getsockname()[0])
+        s.close()
+    except Exception:
+        pass
+    # Add any other non-loopback addresses bound to this host.
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if not ip.startswith("127.") and ip not in ips:
+                ips.append(ip)
+    except Exception:
+        pass
+    return ips
+
+
+def ensure_windows_firewall(port):
+    """On Windows, offer to open the port so other devices can reach the page.
+
+    Adding the rule needs admin rights, so this launches an elevated command,
+    which raises the standard Windows UAC 'allow changes?' prompt. No-op on
+    other platforms (their firewalls, if any, are handled differently)."""
+    if platform.system() != "Windows":
+        return
+    rule = "ModFire Modbus Console"
+    try:
+        out = subprocess.run(
+            ["netsh", "advfirewall", "firewall", "show", "rule", f"name={rule}"],
+            capture_output=True, text=True)
+        if rule in out.stdout and "No rules match" not in out.stdout:
+            print(f"  Windows Firewall: rule '{rule}' is already in place.")
+            return
+    except Exception:
+        pass
+
+    print("\n  Windows Firewall")
+    print(f"  To reach this page from other devices, Windows must allow inbound")
+    print(f"  TCP port {port}.")
+    try:
+        ans = input("  Add the firewall rule now? A Windows prompt will appear. [Y/n]: ")
+    except EOFError:
+        ans = "n"
+    manual = (f'netsh advfirewall firewall add rule name="{rule}" '
+              f'dir=in action=allow protocol=TCP localport={port}')
+    if ans.strip().lower() in ("", "y", "yes"):
+        ps = (f'Start-Process netsh -Verb RunAs -ArgumentList '
+              f"'advfirewall firewall add rule name=\"{rule}\" dir=in action=allow "
+              f"protocol=TCP localport={port}'")
+        try:
+            subprocess.run(["powershell", "-NoProfile", "-Command", ps], check=False)
+            print("  → Approve the Windows 'allow changes?' prompt to finish.")
+            print(f"    (If you declined, run this later as Administrator:\n     {manual})")
+        except Exception as e:
+            print(f"  Could not open the prompt automatically: {e}")
+            print(f"  Run this as Administrator instead:\n     {manual}")
+    else:
+        print("  Skipped — other devices may be blocked until you allow the port.")
+        print(f"  To allow it later, run as Administrator:\n     {manual}")
+
+
 def main():
+    SERVER_INFO["ips"] = get_local_ips()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
-    url = f"http://{HOST}:{PORT}"
+
     print("=" * 60)
     print("  ModFire — Modbus TCP Console (Monitor · Control · Scan)")
     print("=" * 60)
-    print(f"  Open this in your browser:  {url}")
-    print("  Press Ctrl+C to stop the server.")
+    print("  Open one of these in your browser:")
+    print(f"    • On this PC:        http://127.0.0.1:{PORT}")
+    for ip in SERVER_INFO["ips"]:
+        print(f"    • On the network:    http://{ip}:{PORT}")
+    if not SERVER_INFO["ips"]:
+        print("    (Could not detect a LAN IP — check your network connection.)")
     print("=" * 60)
+
+    ensure_windows_firewall(PORT)
+
+    print("\n  Server running. Press Ctrl+C to stop.")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

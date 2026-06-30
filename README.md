@@ -22,10 +22,35 @@ third-party packages — Python standard library only.
 ## Run it
 
 ```bash
-python3 modfire_web.py
+python3 modfire_web.py     # on Windows:  python modfire_web.py
 ```
 
-Then open the URL it prints (default <http://127.0.0.1:8512>) in your browser.
+On startup it prints **this PC's IP address** and the URLs to open — both on
+this machine and from other devices on the network, for example:
+
+```
+  Open one of these in your browser:
+    • On this PC:        http://127.0.0.1:8512
+    • On the network:    http://192.168.23.50:8512
+```
+
+The same address is shown in the top-right of the web page (🖥 This PC: …).
+
+### Network access & Windows Firewall
+
+The server listens on all network interfaces so a tablet or another PC on the
+same network can open it. The first time you run it on **Windows**, it offers to
+add a firewall rule for the port and launches an elevated command — approve the
+Windows **"allow changes?"** prompt to let other devices connect. If you skip it
+(or aren't on Windows reaching it remotely), you can add it later as
+Administrator:
+
+```
+netsh advfirewall firewall add rule name="ModFire Modbus Console" dir=in action=allow protocol=TCP localport=8512
+```
+
+To keep the page private to this machine only, set `HOST = "127.0.0.1"` near the
+top of `modfire_web.py` (no firewall rule needed then).
 
 ## Use it
 
@@ -71,8 +96,8 @@ internet, an online OUI API — failing gracefully to just the raw MAC.
 
 ## Notes
 
-- The server binds to `127.0.0.1` only (local machine). Change `HOST`/`PORT` at
-  the top of `modfire_web.py` if needed.
+- The server binds to all interfaces (`0.0.0.0`) so the LAN can reach it; change
+  `HOST`/`PORT` at the top of `modfire_web.py` if needed.
 - The Python server must run on a machine that can reach the Modbus gateway
   (the browser can't open raw TCP sockets itself).
 - Multiple browser tabs can watch the same live stream simultaneously; field
