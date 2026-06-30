@@ -133,6 +133,81 @@ def parse_write_coil_response(response):
     raise ValueError(f"Unexpected response (hex): {response.hex().upper()}")
 
 
+# Standard object IDs returned by FC43 / MEI Type 14 (Read Device Identification).
+DEVID_OBJECTS = {
+    0x00: "vendor",        # VendorName  (the "make")
+    0x01: "product_code",  # ProductCode
+    0x02: "revision",      # MajorMinorRevision
+    0x03: "vendor_url",
+    0x04: "product_name",  # ProductName (often the "model")
+    0x05: "model_name",    # ModelName
+    0x06: "app_name",      # UserApplicationName
+}
+
+
+def read_device_identification(ip, port, slave, timeout):
+    """Best-effort Modbus FC43 / MEI-14 'Read Device Identification'.
+
+    Returns a dict like {"vendor": "...", "product_name": "...", ...}, or {} if
+    the device doesn't support it. Uses its own short-lived socket so a failure
+    here never disturbs the main scan connection.
+    """
+    found = {}
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect((ip, port))
+    except Exception:
+        return found
+    tid = 0
+    try:
+        # Object access levels: 0x01 = basic (objs 0-2), 0x02 = regular (objs 3-6).
+        for code, start in ((0x01, 0x00), (0x02, 0x03)):
+            obj_id = start
+            for _ in range(8):  # follow the "more follows" continuation flag
+                tid = (tid % 0xFFFF) + 1
+                pdu = bytes([0x2B, 0x0E, code, obj_id])
+                frame = (tid.to_bytes(2, "big") + b"\x00\x00"
+                         + (1 + len(pdu)).to_bytes(2, "big") + bytes([slave & 0xFF]) + pdu)
+                try:
+                    s.send(frame)
+                    resp = s.recv(1024)
+                except Exception:
+                    return found
+                if len(resp) < 8 or resp[7] == 0xAB:  # exception => unsupported level
+                    break
+                if resp[7] != 0x2B or len(resp) < 14:
+                    break
+                more, next_id, num = resp[11], resp[12], resp[13]
+                idx = 14
+                for _ in range(num):
+                    if idx + 2 > len(resp):
+                        break
+                    oid, olen = resp[idx], resp[idx + 1]
+                    val = resp[idx + 2:idx + 2 + olen]
+                    idx += 2 + olen
+                    name = DEVID_OBJECTS.get(oid, f"obj_{oid}")
+                    found[name] = val.decode("ascii", "replace").strip()
+                if more == 0xFF:
+                    obj_id = next_id
+                else:
+                    break
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+    return found
+
+
+def derive_make_model(devid):
+    """Pick a human 'make' and 'model' from a device-identification dict."""
+    make = (devid.get("vendor") or "").strip()
+    model = (devid.get("model_name") or devid.get("product_name")
+             or devid.get("product_code") or "").strip()
+    return make, model
+
+
 # ---------------------------------------------------------------------------
 # Event hub: broadcasts events to all connected SSE clients, per channel
 # ---------------------------------------------------------------------------
@@ -495,12 +570,21 @@ class ScanManager:
                         s.close()
                     except Exception:
                         pass
+            make = model = ""
+            if open_port and not self._stop_event.is_set():
+                # Try a few common unit IDs to read the device identification.
+                devid = {}
+                for uid in (1, 0, 255):
+                    devid = read_device_identification(ip, port, uid, max(timeout, 0.8))
+                    if devid:
+                        break
+                make, model = derive_make_model(devid)
             with lock:
                 scanned += 1
                 if open_port:
                     found += 1
                     HUB.publish({"channel": "scan", "type": "scan_found", "kind": "network",
-                                 "ip": ip, "port": port})
+                                 "ip": ip, "port": port, "make": make, "model": model})
                 HUB.publish({"channel": "scan", "type": "scan_progress", "kind": "network",
                              "scanned": scanned, "total": total, "found": found})
 
@@ -591,10 +675,18 @@ class ScanManager:
                     break
 
                 scanned += 1
+                make = model = ""
                 if status == "present":
                     found += 1
+                    devid = read_device_identification(ip, port, slave, max(timeout, 0.8))
+                    make, model = derive_make_model(devid)
+                    if make or model:
+                        HUB.publish({"channel": "scan", "type": "log", "level": "ok",
+                                     "message": f"Slave {slave}: {make or '?'} "
+                                                f"{model or ''}".rstrip()})
                 HUB.publish({"channel": "scan", "type": "scan_device", "slave": slave,
-                             "status": status, "detail": detail})
+                             "status": status, "detail": detail,
+                             "make": make, "model": model})
                 HUB.publish({"channel": "scan", "type": "scan_progress", "kind": "device",
                              "scanned": scanned, "total": total, "found": found})
         finally:
@@ -823,15 +915,19 @@ PAGE = r"""<!DOCTYPE html>
   .found-item{display:flex;align-items:center;gap:10px;background:var(--panel2);border:1px solid var(--line);
     border-radius:8px;padding:9px 12px;font-family:var(--mono);font-size:13px}
   .found-item .ip{font-weight:700;color:var(--ok)}
+  .found-item .mm{color:var(--text);font-weight:400}
+  .found-item .mm .muted{color:var(--muted)}
   .found-item button{margin-left:auto;padding:5px 10px;border-radius:6px;border:1px solid var(--line);
     background:var(--bg);color:var(--text);cursor:pointer;font-size:12px;font-weight:600}
   .found-item button:hover{border-color:var(--accent2)}
-  .slavegrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(74px,1fr));gap:8px;margin-top:10px}
-  .slave{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 4px;text-align:center;
-    font-family:var(--mono);font-size:13px;color:var(--muted)}
+  .slavegrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(96px,1fr));gap:8px;margin-top:10px}
+  .slave{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 6px;text-align:center;
+    font-family:var(--mono);font-size:13px;color:var(--muted);min-height:34px}
   .slave.present{background:#11301d;border-color:var(--ok);color:var(--ok);font-weight:700}
   .slave.timeout{opacity:.5}
   .slave.other{border-color:var(--warn);color:var(--warn)}
+  .slave .mm{display:block;font-size:10px;font-weight:600;color:var(--accent2);margin-top:3px;line-height:1.25;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 </style>
 </head>
 <body>
@@ -958,7 +1054,9 @@ PAGE = r"""<!DOCTYPE html>
       <button class="act" onclick="scanStop()">■ Stop</button>
     </div>
     <div class="hint">Network scan finds hosts with the Modbus port open. Slave scan probes
-      each unit ID with a read — a reply (data <i>or</i> exception) proves a module is present.</div>
+      each unit ID with a read — a reply (data <i>or</i> exception) proves a module is present.
+      For each device found, ModFire also asks for its identification (FC43) and shows the
+      <b>make / model</b> when the device reports it (not all do).</div>
   </section>
   <section>
     <div class="panel">
@@ -1095,20 +1193,28 @@ function useGateway(ip){
   $("c_target_ip").value=ip; $("m_target_ip").value=ip; $("s_dev_ip").value=ip;
   saveAll(); addLog("s_log","ok","Gateway "+ip+" copied to Monitor & Control.");
 }
-function addFoundHost(ip, port){
+function mmText(make, model){
+  const m=[make,model].map(x=>(x||"").trim()).filter(Boolean).join(" · ");
+  return m ? esc(m) : '<span class="muted">make/model not reported</span>';
+}
+function addFoundHost(ip, port, make, model){
   const box=$("s_net_found");
   if(box.dataset.has!=="1"){ box.innerHTML=""; box.dataset.has="1"; }
   const d=document.createElement("div"); d.className="found-item";
   d.innerHTML='<span class="ip">'+esc(ip)+'</span><span style="color:var(--muted)">:'+port+'</span>'+
+    '<span class="mm">'+mmText(make,model)+'</span>'+
     '<button onclick="useGateway(\''+esc(ip)+'\')">Use</button>';
   box.appendChild(d);
 }
-function addSlave(slave, status, detail){
+function addSlave(slave, status, detail, make, model){
   const grid=$("s_dev_grid");
   if(grid.dataset.has!=="1"){ grid.innerHTML=""; grid.dataset.has="1"; }
   let cls="timeout"; if(status==="present") cls="present"; else if(status==="other") cls="other";
-  const d=document.createElement("div"); d.className="slave "+cls; d.title=detail||"";
-  d.textContent="#"+slave; grid.appendChild(d);
+  const d=document.createElement("div"); d.className="slave "+cls;
+  const mm=[make,model].map(x=>(x||"").trim()).filter(Boolean).join(" ");
+  d.title=(detail||"")+(mm?("  —  "+mm):"");
+  d.innerHTML="#"+slave+(mm?'<span class="mm">'+esc(mm)+'</span>':"");
+  grid.appendChild(d);
 }
 
 // ---------------- SSE routing ----------------
@@ -1130,8 +1236,8 @@ function handle(ev){
     if(ev.type==="scan_status"){ updateBadge("scan",ev.state,ev.message); scanRunning(ev.state==="running");
       const p=ev.kind==="device"?"s_dev_prog":"s_net_prog"; $(p).textContent=ev.message; }
     else if(ev.type==="log") addLog("s_log",ev.level||"info",ev.message,ev.ts);
-    else if(ev.type==="scan_found") addFoundHost(ev.ip, ev.port);
-    else if(ev.type==="scan_device") addSlave(ev.slave, ev.status, ev.detail);
+    else if(ev.type==="scan_found") addFoundHost(ev.ip, ev.port, ev.make, ev.model);
+    else if(ev.type==="scan_device") addSlave(ev.slave, ev.status, ev.detail, ev.make, ev.model);
     else if(ev.type==="scan_progress"){
       const pct=ev.total?Math.round(ev.scanned/ev.total*100):0;
       if(ev.kind==="device"){ $("s_dev_bar").style.width=pct+"%"; $("s_dev_prog").textContent=ev.scanned+"/"+ev.total; $("s_dev_count").textContent=ev.found+" found"; }

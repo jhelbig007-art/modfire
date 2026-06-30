@@ -52,6 +52,11 @@ Switch between pages with the tabs in the header.
 - **Find slaves** — point at one gateway and probe a range of unit IDs; any
   reply (data *or* a Modbus exception) proves a module is present at that ID.
 
+For every device it finds (gateway or slave), ModFire also requests the device
+identification (Modbus **FC43 / MEI-14**) and shows the **make / model** when
+the device reports it. This is best-effort: many simple RS485 devices and some
+gateways don't implement FC43, in which case it shows "make/model not reported".
+
 ## Notes
 
 - The server binds to `127.0.0.1` only (local machine). Change `HOST`/`PORT` at
