@@ -57,6 +57,7 @@ CONTROL_DEFAULTS = {
     "watch_start": 0,
     "watch_count": 16,
     "watch_interval": 1.0,
+    "stale_threshold": 10.0,
 }
 
 SCAN_DEFAULTS = {
@@ -701,10 +702,12 @@ class ControlConnection:
                 return False
 
         if status == "ok":
-            COILS_HISTORY.record(coil, turn_on, time.time())
+            write_ts = time.time()
+            COILS_HISTORY.record(coil, turn_on, write_ts)
             HUB.publish({"channel": "control", "type": "log", "level": "ok",
                          "message": f"Success: {action}"})
-            HUB.publish({"channel": "control", "type": "coil", "coil": coil, "state": turn_on})
+            HUB.publish({"channel": "control", "type": "coil", "coil": coil,
+                         "state": turn_on, "ts": write_ts})
             return True
         HUB.publish({"channel": "control", "type": "log", "level": "error",
                      "message": f"{action}: device rejected (exception {detail})"})
@@ -1183,6 +1186,8 @@ PAGE = r"""<!DOCTYPE html>
   .srv b{color:var(--accent2);font-weight:600}
   .badge{margin-left:14px;display:flex;align-items:center;gap:8px;font-size:13px;
     padding:6px 12px;border-radius:999px;border:1px solid var(--line);background:var(--panel)}
+  .badge #stateTime{color:var(--muted);font-family:var(--mono);font-size:11px;
+    border-left:1px solid var(--line);padding-left:8px;margin-left:2px}
   .dot{width:10px;height:10px;border-radius:50%;background:var(--muted)}
   .dot.idle{background:var(--muted)} .dot.connecting{background:var(--warn);animation:pulse 1s infinite}
   .dot.running{background:var(--ok);animation:pulse 1.4s infinite} .dot.error{background:var(--err)}
@@ -1236,6 +1241,12 @@ PAGE = r"""<!DOCTYPE html>
     color:var(--warn);display:none}
   .coil.counting .cd{display:block}
   .coil.counting{border-color:var(--warn)}
+  .coil.stale{border-color:var(--err);background:#2a1216;animation:stalepulse 2s infinite}
+  .coil.stale .light{background:#402022}
+  @keyframes stalepulse{0%{box-shadow:0 0 0 0 rgba(248,81,73,.45)}70%{box-shadow:0 0 0 6px rgba(248,81,73,0)}100%{box-shadow:0 0 0 0 rgba(248,81,73,0)}}
+  .stale-badge{display:none;font-size:10px;font-weight:700;color:var(--err);margin-top:6px;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .coil.stale .stale-badge{display:block}
   .watchflag{font-size:11px;color:var(--muted);margin:4px 0 2px}
   .watchflag b{color:var(--ok)}
   .timer{display:flex;align-items:center;gap:12px;background:var(--panel2);border:1px solid var(--warn);
@@ -1303,7 +1314,7 @@ PAGE = r"""<!DOCTYPE html>
     <button data-page="scan" onclick="showPage('scan')">🛰 Scan</button>
   </nav>
   <span class="srv" id="serverInfo" title="This PC's address — browse here from other devices">🖥 —</span>
-  <div class="badge"><span id="dot" class="dot idle"></span><span id="stateLbl">Idle</span></div>
+  <div class="badge"><span id="dot" class="dot idle"></span><span id="stateLbl">Idle</span><span id="stateTime"></span></div>
 </header>
 
 <!-- ================= MONITOR ================= -->
@@ -1375,7 +1386,15 @@ PAGE = r"""<!DOCTYPE html>
       <button class="act" id="c_watch" onclick="controlWatch()" disabled data-cdis>👁 Watch</button>
       <button class="act" id="c_unwatch" onclick="controlUnwatch()" disabled>■ Stop watch</button>
     </div>
-    <div class="hint"><b># Coils</b> sets how many coils appear in the bank
+    <div class="field" style="margin-top:12px">
+      <label>Flag if last ON period was shorter than (s)</label>
+      <input id="c_stale_threshold">
+    </div>
+    <div class="hint">If a coil's most recent ON period lasted <i>less</i> than this
+      many seconds before turning OFF, it's highlighted <span style="color:var(--err);font-weight:600">red</span>
+      as a possible short/failed cycle — e.g. a coil meant to hold for 30s that
+      only stayed on for 10s. The flag clears once a subsequent ON period lasts
+      long enough. <b># Coils</b> sets how many coils appear in the bank
       (starting at <b>Start coil</b>) and, once watching, reads their live status
       via FC01 so the lights reflect the device's real state. Change either field
       and the bank resizes immediately — no need to reconnect. Click a coil's
@@ -1479,7 +1498,7 @@ let es = null;
 // ---- field maps (server key -> input id) ----
 const M = ["target_ip","target_port","slave_id","register_addr","num_registers","interval","timeout"];
 const C = ["target_ip","target_port","slave_id","timeout","pulse",
-           "watch_start","watch_count","watch_interval"];
+           "watch_start","watch_count","watch_interval","stale_threshold"];
 const S = ["net_base","net_start","net_end","net_port","net_timeout",
            "dev_ip","dev_port","dev_register","dev_slave_start","dev_slave_end","dev_timeout"];
 
@@ -1492,11 +1511,28 @@ function showPage(p){
   document.querySelectorAll("nav button").forEach(b=>b.classList.toggle("active", b.dataset.page===p));
   setBadge(p);
 }
-let badges = {monitor:["idle","Idle"], control:["idle","Disconnected"], scan:["idle","Idle"]};
+function nowSec(){ return Date.now()/1000; }
+let badges = {
+  monitor:{state:"idle",msg:"Idle",since:null},
+  control:{state:"idle",msg:"Disconnected",since:null},
+  scan:{state:"idle",msg:"Idle",since:null}
+};
 let current = "monitor";
-function setBadge(p){ current=p; const [s,m]=badges[p]||["idle","Idle"];
-  $("dot").className="dot "+s; $("stateLbl").textContent=m; }
-function updateBadge(ch, state, msg){ badges[ch]=[state,msg||state]; if(current===ch) setBadge(ch); }
+function setBadge(p){
+  current=p; const b=badges[p]||{state:"idle",msg:"Idle",since:null};
+  $("dot").className="dot "+b.state; $("stateLbl").textContent=b.msg;
+  renderStateTime();
+}
+function updateBadge(ch, state, msg){
+  const prev=badges[ch];
+  const changed=!prev || prev.state!==state;
+  badges[ch]={state:state, msg:msg||state, since: changed?nowSec():(prev?prev.since:nowSec())};
+  if(current===ch) setBadge(ch);
+}
+function renderStateTime(){
+  const b=badges[current];
+  $("stateTime").textContent=(b && b.since)?("· "+dur(nowSec()-b.since)):"";
+}
 
 function pad(n){return String(n).padStart(2,"0");}
 function tstr(ts){const d=ts?new Date(ts*1000):new Date();return pad(d.getHours())+":"+pad(d.getMinutes())+":"+pad(d.getSeconds());}
@@ -1565,6 +1601,7 @@ function buildBank(){
     c.innerHTML='<div class="cidx" style="cursor:pointer" title="Click for 30-min history" '+
       'onclick="showHistory('+i+')">Coil '+i+' &#128203;</div>'+
       '<div class="cd" id="cd'+i+'"></div><div class="light"></div>'+
+      '<div class="stale-badge" id="stale'+i+'"></div>'+
       '<div class="mini"><button onclick="bankCoil('+i+',\'on\')">ON</button>'+
       '<button onclick="bankCoil('+i+',\'off\')">OFF</button>'+
       '<button onclick="bankCoil('+i+',\'fire\')">⚡</button></div>';
@@ -1573,7 +1610,39 @@ function buildBank(){
   $("c_bank_range").textContent="Coils "+start+"–"+(start+capped-1);
   $("c_bank_note").textContent=(count>capped)?("showing first "+capped+" of "+count+" watched"):"";
 }
-function setCoilLight(coil, on){ const c=$("coil"+coil); if(c) c.classList.toggle("on", !!on); }
+// ---- short-cycle flagging: was the coil's LAST completed ON period ----
+// ---- shorter than the configured threshold? ----
+let coilKnown={};       // coil -> {state, since}  (current known state + when it started)
+let lastOnDuration={};  // coil -> seconds the most recent completed ON period lasted
+function setCoilLight(coil, on, ts){
+  const c=$("coil"+coil); if(c) c.classList.toggle("on", !!on);
+  ts = ts || nowSec();
+  on = !!on;
+  const prev = coilKnown[coil];
+  if(prev === undefined){ coilKnown[coil] = {state:on, since:ts}; return; }
+  if(prev.state === on){ return; }  // no transition, leave "since" alone
+  if(prev.state === true && on === false){
+    lastOnDuration[coil] = Math.max(0, ts - prev.since);
+  }
+  coilKnown[coil] = {state:on, since:ts};
+}
+function updateStaleness(){
+  const thr=parseFloat($("c_stale_threshold").value);
+  const threshold=(isNaN(thr)||thr<=0)?null:thr;
+  for(let n=0;n<bankCount;n++){
+    const coil=bankStart+n, el=$("coil"+coil), badge=$("stale"+coil);
+    if(!el) continue;
+    const isOn=el.classList.contains("on");
+    const d=lastOnDuration[coil];
+    if(isOn || threshold===null || d===undefined){
+      el.classList.remove("stale"); if(badge) badge.textContent=""; continue;
+    }
+    if(d < threshold){
+      el.classList.add("stale");
+      if(badge) badge.textContent="⚠ last ON only "+dur(d)+" (< "+dur(threshold)+")";
+    } else { el.classList.remove("stale"); if(badge) badge.textContent=""; }
+  }
+}
 function setCoilCountdown(coil, remaining, done){
   const c=$("coil"+coil), cd=$("cd"+coil); if(!c||!cd) return;
   if(done){ c.classList.remove("counting"); cd.textContent=""; }
@@ -1717,9 +1786,9 @@ function handle(ev){
     if(ev.type==="status"){ updateBadge("control",ev.state,ev.message); controlBtns(ev.state==="running");
       if(ev.state!=="idle") addLog("c_log",ev.state==="error"?"error":"info",ev.message,ev.ts); }
     else if(ev.type==="log") addLog("c_log",ev.level||"info",ev.message,ev.ts);
-    else if(ev.type==="coil") setCoilLight(ev.coil, ev.state);
+    else if(ev.type==="coil") setCoilLight(ev.coil, ev.state, ev.ts);
     else if(ev.type==="coil_status"){
-      for(let i=0;i<ev.states.length;i++) setCoilLight(ev.start+i, ev.states[i]);
+      for(let i=0;i<ev.states.length;i++) setCoilLight(ev.start+i, ev.states[i], ev.ts);
     }
     else if(ev.type==="countdown"){
       setCoilCountdown(ev.coil, ev.remaining, ev.done);
@@ -1791,6 +1860,7 @@ window.addEventListener("load", async ()=>{
   $("c_watch_start").addEventListener("input", buildBank);
   $("c_watch_count").addEventListener("input", buildBank);
   connectStream();
+  setInterval(()=>{ renderStateTime(); updateStaleness(); }, 1000);
 });
 </script>
 </body>

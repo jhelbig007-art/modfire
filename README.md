@@ -83,6 +83,16 @@ Switch between pages with the tabs in the header.
 5. **30-minute history** — every coil's ON/OFF changes are logged for the last
    30 minutes. **Click a coil's name** in the bank to open its timeline (each
    state, when it changed, and how long it was held, plus total ON time).
+6. **Short-cycle flag** — set **Flag if last ON period was shorter than (s)**
+   (default 10s). If a coil's most recent completed ON period lasted *less*
+   than that many seconds before turning OFF, the coil is highlighted **red**
+   with a badge showing how short it was — e.g. a coil meant to hold for 30s
+   that only stayed on for 10s (a possible short/failed cycle). A coil currently
+   ON is never flagged; the flag clears as soon as a later ON period lasts long
+   enough. Works for both manual ON/OFF and Pulse.
+
+The header badge next to each page's status also shows how long it's been in
+that state (e.g. "Connected · 4m12s"), updating live.
 
 ### Scan
 - **Find gateways** — enter a subnet (first three octets) and host range; it
