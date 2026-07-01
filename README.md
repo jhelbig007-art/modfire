@@ -7,7 +7,7 @@ scripts into one multi-page UI:
 - **📊 Monitor** — continuously read Holding Registers (FC03) and watch values
   update live (the `modpoll` script).
 - **🎚 Control** — fire coils (FC05): turn ON/OFF, or **Pulse** (ON → wait → OFF),
-  plus a 16-coil quick bank (the `modfire` coil script).
+  plus a configurable-size quick bank (the `modfire` coil script).
 - **🛰 Scan** — discover Modbus modules: find gateways on your network (open
   Modbus port) and probe a gateway for responding RS485 slave IDs.
 
@@ -66,15 +66,21 @@ Switch between pages with the tabs in the header.
 ### Control
 1. Fill in gateway IP/port/slave (default `192.168.23.200:502`, slave 1) and a
    **Pulse** duration, then **Connect**.
-2. Fire a coil by index with **ON** / **OFF** / **⚡ Pulse**, or use the 16-coil
-   quick bank. Pulse turns the coil ON, waits, then OFF — like the original
-   script's 5-second cycle, with a **live countdown** shown on the coil and in a
-   timer banner.
-3. **Coil status watch** — on Connect, ModFire polls live coil states with
-   **FC01 (Read Coils)** so the bank lights reflect the device's *actual* status,
-   not just what was commanded. Adjust the range/interval and toggle it with
-   **Watch** / **Stop watch**.
-4. **30-minute history** — every coil's ON/OFF changes are logged for the last
+2. Fire a coil by index with **ON** / **OFF** / **⚡ Pulse**, or use the quick
+   bank. Pulse turns the coil ON, waits, then OFF — like the original script's
+   5-second cycle, with a **live countdown** shown on the coil and in a timer
+   banner.
+3. **Coil bank size** — set **Start coil** and **# Coils** to size the bank to
+   your device (e.g. start `0`, count `32`). It resizes immediately as you type,
+   no reconnect needed. Modbus allows up to 2000 coils per read; the bank
+   display itself is capped at 512 cells to stay responsive — the status watch
+   still covers your full requested count either way.
+4. **Coil status watch** — on Connect, ModFire polls live coil states with
+   **FC01 (Read Coils)** over the same Start coil/# Coils range, so the bank
+   lights reflect the device's *actual* status, not just what was commanded.
+   Change the range/interval and click **Watch** to re-apply, or **Stop watch**
+   to pause it.
+5. **30-minute history** — every coil's ON/OFF changes are logged for the last
    30 minutes. **Click a coil's name** in the bank to open its timeline (each
    state, when it changed, and how long it was held, plus total ON time).
 

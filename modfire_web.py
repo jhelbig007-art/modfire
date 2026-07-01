@@ -1365,7 +1365,7 @@ PAGE = r"""<!DOCTYPE html>
     <div class="hint">Connect once, then fire coils. <b>Pulse</b> turns a coil ON,
       waits the pulse time, then OFF — like the original script.</div>
 
-    <h2 style="margin-top:18px">Coil Status Watch (FC01)</h2>
+    <h2 style="margin-top:18px">Coil Bank &amp; Status Watch (FC01)</h2>
     <div class="row">
       <div class="field"><label>Start coil</label><input id="c_watch_start"></div>
       <div class="field"><label># Coils</label><input id="c_watch_count"></div>
@@ -1375,9 +1375,13 @@ PAGE = r"""<!DOCTYPE html>
       <button class="act" id="c_watch" onclick="controlWatch()" disabled data-cdis>👁 Watch</button>
       <button class="act" id="c_unwatch" onclick="controlUnwatch()" disabled>■ Stop watch</button>
     </div>
-    <div class="hint">Reads live coil states (FC01) so the bank lights reflect the
-      device's real status. Auto-starts on Connect. Click a coil's name to see its
-      last 30 min of state changes.</div>
+    <div class="hint"><b># Coils</b> sets how many coils appear in the bank
+      (starting at <b>Start coil</b>) and, once watching, reads their live status
+      via FC01 so the lights reflect the device's real state. Change either field
+      and the bank resizes immediately — no need to reconnect. Click a coil's
+      name to see its last 30 min of state changes. Up to 2000 coils can be
+      watched (Modbus's own limit); the bank display is capped at 512 to stay
+      responsive.</div>
   </section>
   <section>
     <div class="panel">
@@ -1397,6 +1401,7 @@ PAGE = r"""<!DOCTYPE html>
         </div>
       </div>
       <div class="watchflag" id="c_watchflag">Coil watch: <b>off</b></div>
+      <div class="meta"><span id="c_bank_range">Coils 0–15</span><span id="c_bank_note"></span></div>
       <div id="c_bank" class="grid"></div>
     </div>
     <div class="panel"><h2>Command Log</h2><div id="c_log" class="log"></div></div>
@@ -1546,9 +1551,16 @@ function watchBtns(watching){
   $("c_unwatch").disabled=!watching;
   $("c_watchflag").innerHTML="Coil watch: <b>"+(watching?"on":"off")+"</b>";
 }
+const BANK_RENDER_CAP = 512;
+let bankStart=0, bankCount=16;
 function buildBank(){
+  let start=parseInt($("c_watch_start").value,10); if(isNaN(start)) start=0;
+  let count=parseInt($("c_watch_count").value,10); if(isNaN(count)||count<1) count=1;
+  const capped=Math.min(count, BANK_RENDER_CAP);
+  bankStart=start; bankCount=capped;
   const bank=$("c_bank"); bank.innerHTML="";
-  for(let i=0;i<16;i++){
+  for(let n=0;n<capped;n++){
+    const i=start+n;
     const c=document.createElement("div"); c.className="coil"; c.id="coil"+i;
     c.innerHTML='<div class="cidx" style="cursor:pointer" title="Click for 30-min history" '+
       'onclick="showHistory('+i+')">Coil '+i+' &#128203;</div>'+
@@ -1558,6 +1570,8 @@ function buildBank(){
       '<button onclick="bankCoil('+i+',\'fire\')">⚡</button></div>';
     bank.appendChild(c);
   }
+  $("c_bank_range").textContent="Coils "+start+"–"+(start+capped-1);
+  $("c_bank_note").textContent=(count>capped)?("showing first "+capped+" of "+count+" watched"):"";
 }
 function setCoilLight(coil, on){ const c=$("coil"+coil); if(c) c.classList.toggle("on", !!on); }
 function setCoilCountdown(coil, remaining, done){
@@ -1711,7 +1725,13 @@ function handle(ev){
       setCoilCountdown(ev.coil, ev.remaining, ev.done);
       updateTimer(ev.coil, ev.remaining, ev.total, ev.done);
     }
-    else if(ev.type==="watch"){ watchBtns(!!ev.watching); }
+    else if(ev.type==="watch"){
+      watchBtns(!!ev.watching);
+      if(ev.watching && ev.start!==undefined && ev.count!==undefined){
+        $("c_watch_start").value=ev.start; $("c_watch_count").value=ev.count;
+        buildBank(); saveAll();
+      }
+    }
   } else if(ch==="scan"){
     if(ev.type==="scan_status"){ updateBadge("scan",ev.state,ev.message); scanRunning(ev.state==="running");
       const p=ev.kind==="device"?"s_dev_prog":"s_net_prog"; $(p).textContent=ev.message; }
@@ -1747,7 +1767,6 @@ function saveAll(){
   }));
 }
 window.addEventListener("load", async ()=>{
-  buildBank();
   // 1) server defaults
   let cfg=null; try{ cfg=await (await fetch("/config")).json(); }catch(e){}
   if(cfg){ fill("m_",M,cfg.monitor); fill("c_",C,cfg.control); fill("s_",S,cfg.scan);
@@ -1761,6 +1780,7 @@ window.addEventListener("load", async ()=>{
   // 2) saved overrides
   try{ const saved=JSON.parse(localStorage.getItem("modfire")||"{}");
     if(saved.m) fill("m_",M,saved.m); if(saved.c) fill("c_",C,saved.c); if(saved.s) fill("s_",S,saved.s); }catch(e){}
+  buildBank();
   // 3) live state
   if(cfg){
     if(cfg.monitor.running){ updateBadge("monitor","running","Polling"); monitorBtns(true); }
@@ -1768,6 +1788,8 @@ window.addEventListener("load", async ()=>{
       watchBtns(!!cfg.control.watching); }
   }
   document.querySelectorAll("input").forEach(i=>i.addEventListener("change",saveAll));
+  $("c_watch_start").addEventListener("input", buildBank);
+  $("c_watch_count").addEventListener("input", buildBank);
   connectStream();
 });
 </script>
