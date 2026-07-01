@@ -25,6 +25,7 @@ import socket
 import subprocess
 import threading
 import time
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -53,6 +54,9 @@ CONTROL_DEFAULTS = {
     "slave_id": 1,
     "timeout": 4.0,
     "pulse": 5.0,
+    "watch_start": 0,
+    "watch_count": 16,
+    "watch_interval": 1.0,
 }
 
 SCAN_DEFAULTS = {
@@ -99,6 +103,19 @@ def build_write_coil_packet(transaction_id, slave_id, coil_address, turn_on):
     )
 
 
+def build_read_coils_packet(transaction_id, slave_id, start_coil, count):
+    """Modbus TCP frame for FC01 (Read Coils)."""
+    return (
+        transaction_id.to_bytes(2, "big")
+        + b"\x00\x00"
+        + b"\x00\x06"
+        + bytes([slave_id & 0xFF])
+        + b"\x01"
+        + start_coil.to_bytes(2, "big")
+        + count.to_bytes(2, "big")
+    )
+
+
 EXCEPTION_MEANINGS = {
     1: "Illegal Function",
     2: "Illegal Data Address",
@@ -140,6 +157,23 @@ def parse_write_coil_response(response):
         code = response[8]
         return "exception", f"{code}: {EXCEPTION_MEANINGS.get(code, 'Unknown')}"
     raise ValueError(f"Unexpected response (hex): {response.hex().upper()}")
+
+
+def parse_read_coils_response(response, count):
+    """Return a list of `count` booleans from an FC01 reply. Raises ValueError on a bad frame."""
+    if len(response) < 9:
+        raise ValueError(f"Short frame ({len(response)} bytes): {response.hex().upper()}")
+    fc = response[7]
+    if fc == 0x81:
+        code = response[8] if len(response) > 8 else 0
+        raise ValueError(f"Modbus exception {code}: {EXCEPTION_MEANINGS.get(code, 'Unknown')}")
+    if fc != 0x01:
+        raise ValueError(f"Unexpected response (hex): {response.hex().upper()}")
+    byte_count = response[8]
+    if len(response) < 9 + byte_count:
+        raise ValueError(f"Incomplete packet: expected {9 + byte_count} bytes, got {len(response)}")
+    data = response[9:9 + byte_count]
+    return [bool((data[i // 8] >> (i % 8)) & 1) for i in range(count)]
 
 
 # Standard object IDs returned by FC43 / MEI Type 14 (Read Device Identification).
@@ -513,6 +547,56 @@ MANAGER = PollerManager()
 
 
 # ---------------------------------------------------------------------------
+# Coil history: remembers each coil's state changes for the last 30 minutes
+# ---------------------------------------------------------------------------
+COIL_HISTORY_WINDOW = 1800  # seconds
+
+
+class CoilHistory:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._hist = {}  # coil -> list of (ts, state_bool), transitions only
+
+    def record(self, coil, state, ts):
+        state = bool(state)
+        with self._lock:
+            lst = self._hist.setdefault(int(coil), [])
+            if not lst or lst[-1][1] != state:
+                lst.append((ts, state))
+            self._prune_locked(int(coil), ts)
+
+    def _prune_locked(self, coil, now):
+        cutoff = now - COIL_HISTORY_WINDOW
+        lst = self._hist.get(coil)
+        if not lst:
+            return
+        # Keep the last transition before the window (the state at window start)
+        # plus everything inside the window.
+        last_before = -1
+        for i, (ts, _) in enumerate(lst):
+            if ts < cutoff:
+                last_before = i
+            else:
+                break
+        if last_before > 0:
+            self._hist[coil] = lst[last_before:]
+
+    def get(self, coil, now):
+        with self._lock:
+            self._prune_locked(int(coil), now)
+            return list(self._hist.get(int(coil), []))
+
+    def summary(self, now):
+        with self._lock:
+            for c in list(self._hist):
+                self._prune_locked(c, now)
+            return {c: len(v) for c, v in self._hist.items() if v}
+
+
+COILS_HISTORY = CoilHistory()
+
+
+# ---------------------------------------------------------------------------
 # Control: persistent connection used to write coils (FC05)
 # ---------------------------------------------------------------------------
 class ControlConnection:
@@ -521,6 +605,8 @@ class ControlConnection:
         self._sock = None
         self._tid = 0
         self.config = {}
+        self._watch_thread = None
+        self._watch_stop = threading.Event()
 
     def _next_tid(self):
         self._tid = (self._tid % 0xFFFF) + 1
@@ -530,7 +616,13 @@ class ControlConnection:
         with self._lock:
             return self._sock is not None
 
+    def is_watching(self):
+        t = self._watch_thread
+        return bool(t and t.is_alive())
+
     def connect(self, cfg):
+        self.stop_watch()
+        ok = False
         with self._lock:
             self._close_locked()
             ip, port = cfg["target_ip"], int(cfg["target_port"])
@@ -543,20 +635,24 @@ class ControlConnection:
                 s.connect((ip, port))
                 self._sock = s
                 self.config = dict(cfg)
+                ok = True
                 HUB.publish({"channel": "control", "type": "log", "level": "ok",
                              "message": "TCP link active. Ready to fire coils."})
                 HUB.publish({"channel": "control", "type": "status", "state": "running",
                              "message": f"Connected to {ip}:{port} (slave {cfg['slave_id']})"})
-                return True
             except Exception as e:
                 self._sock = None
                 HUB.publish({"channel": "control", "type": "log", "level": "error",
                              "message": f"Connection failed: {e}"})
                 HUB.publish({"channel": "control", "type": "status", "state": "error",
                              "message": f"Connection failed: {e}"})
-                return False
+        if ok:
+            # Auto-start watching coil status right away.
+            self.start_watch(cfg)
+        return ok
 
     def disconnect(self):
+        self.stop_watch()
         with self._lock:
             self._close_locked()
         HUB.publish({"channel": "control", "type": "log", "level": "info",
@@ -605,6 +701,7 @@ class ControlConnection:
                 return False
 
         if status == "ok":
+            COILS_HISTORY.record(coil, turn_on, time.time())
             HUB.publish({"channel": "control", "type": "log", "level": "ok",
                          "message": f"Success: {action}"})
             HUB.publish({"channel": "control", "type": "coil", "coil": coil, "state": turn_on})
@@ -614,23 +711,107 @@ class ControlConnection:
         return False
 
     def pulse(self, coil, duration):
-        """ON, wait `duration` seconds, then OFF — in a background thread."""
+        """ON, wait `duration` seconds (streaming a countdown), then OFF."""
         def _run():
             if not self.write_coil(coil, True):
                 return
             HUB.publish({"channel": "control", "type": "log", "level": "info",
-                         "message": f"Coil {coil}: waiting {duration:g}s before OFF ..."})
-            slept = 0.0
-            while slept < duration:
-                chunk = min(0.1, duration - slept)
-                time.sleep(chunk)
-                slept += chunk
+                         "message": f"Coil {coil}: ON — turning OFF in {duration:g}s ..."})
+            total = round(duration, 1)
+            end = time.monotonic() + duration
+            while True:
+                remaining = end - time.monotonic()
+                if remaining <= 0:
+                    break
                 if not self.is_connected():
                     HUB.publish({"channel": "control", "type": "log", "level": "warn",
                                  "message": f"Coil {coil}: connection lost during pulse."})
+                    HUB.publish({"channel": "control", "type": "countdown", "coil": coil,
+                                 "remaining": 0, "total": total, "done": True})
                     return
+                HUB.publish({"channel": "control", "type": "countdown", "coil": coil,
+                             "remaining": round(remaining, 1), "total": total})
+                time.sleep(min(0.2, remaining))
+            HUB.publish({"channel": "control", "type": "countdown", "coil": coil,
+                         "remaining": 0, "total": total, "done": True})
             self.write_coil(coil, False)
         threading.Thread(target=_run, daemon=True).start()
+
+    # --- Coil status watching (FC01 Read Coils) -------------------------
+    def start_watch(self, cfg):
+        self.stop_watch()
+        if not self.is_connected():
+            HUB.publish({"channel": "control", "type": "log", "level": "error",
+                         "message": "Connect before watching coil status."})
+            return False
+        start = int(cfg.get("watch_start", 0))
+        count = max(1, min(2000, int(cfg.get("watch_count", 16))))
+        interval = max(0.1, float(cfg.get("watch_interval", 1.0)))
+        self.config.update({"watch_start": start, "watch_count": count,
+                            "watch_interval": interval})
+        self._watch_stop = threading.Event()
+        self._watch_thread = threading.Thread(
+            target=self._watch_loop, args=(start, count, interval), daemon=True)
+        self._watch_thread.start()
+        HUB.publish({"channel": "control", "type": "watch", "watching": True,
+                     "start": start, "count": count})
+        HUB.publish({"channel": "control", "type": "log", "level": "info",
+                     "message": f"Watching coils {start}–{start + count - 1} "
+                                f"every {interval:g}s (FC01)."})
+        return True
+
+    def stop_watch(self):
+        self._watch_stop.set()
+        t = self._watch_thread
+        if t and t.is_alive():
+            t.join(timeout=3.0)
+        self._watch_thread = None
+
+    def _watch_loop(self, start, count, interval):
+        last_error = None
+        while not self._watch_stop.is_set():
+            ts = time.time()
+            states = None
+            err = None
+            fatal = False
+            with self._lock:
+                if not self._sock:
+                    break
+                slave = int(self.config.get("slave_id", 1))
+                try:
+                    self._sock.send(build_read_coils_packet(self._next_tid(), slave, start, count))
+                    resp = self._sock.recv(1024)
+                    if not resp:
+                        raise ConnectionError("Connection closed by remote host")
+                    states = parse_read_coils_response(resp, count)
+                except socket.timeout:
+                    err = "no reply (does this device support Read Coils / FC01?)"
+                except (ConnectionError, OSError) as e:
+                    err = f"link error: {e}"
+                    fatal = True
+                    self._close_locked()
+                except ValueError as e:
+                    err = str(e)
+            if states is not None:
+                for i, st in enumerate(states):
+                    COILS_HISTORY.record(start + i, st, ts)
+                HUB.publish({"channel": "control", "type": "coil_status", "start": start,
+                             "states": states, "ts": ts})
+                last_error = None
+            elif err and err != last_error:
+                HUB.publish({"channel": "control", "type": "log", "level": "warn",
+                             "message": f"Coil watch: {err}"})
+                last_error = err
+                if fatal:
+                    HUB.publish({"channel": "control", "type": "status", "state": "error",
+                                 "message": f"Link error: {err}"})
+                    break
+            slept = 0.0
+            while slept < interval and not self._watch_stop.is_set():
+                chunk = min(0.1, interval - slept)
+                time.sleep(chunk)
+                slept += chunk
+        HUB.publish({"channel": "control", "type": "watch", "watching": False})
 
 
 CONTROL = ControlConnection()
@@ -862,10 +1043,22 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/config":
             self._json(200, {
                 "monitor": dict(MONITOR_DEFAULTS, running=MANAGER.is_running()),
-                "control": dict(CONTROL_DEFAULTS, connected=CONTROL.is_connected()),
+                "control": dict(CONTROL_DEFAULTS, connected=CONTROL.is_connected(),
+                                watching=CONTROL.is_watching()),
                 "scan": dict(SCAN_DEFAULTS, running=SCAN.is_running()),
                 "server": {"ips": SERVER_INFO["ips"], "port": PORT},
             })
+        elif self.path.startswith("/control/history"):
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            now = time.time()
+            if "coil" in q:
+                coil = int(q["coil"][0])
+                entries = [{"ts": ts, "state": st} for ts, st in COILS_HISTORY.get(coil, now)]
+                self._json(200, {"coil": coil, "now": now,
+                                 "window": COIL_HISTORY_WINDOW, "entries": entries})
+            else:
+                self._json(200, {"now": now, "window": COIL_HISTORY_WINDOW,
+                                 "summary": COILS_HISTORY.summary(now)})
         elif self.path == "/stream":
             self._stream()
         else:
@@ -895,6 +1088,15 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, {"ok": ok})
             elif self.path == "/control/disconnect":
                 CONTROL.disconnect()
+                self._json(200, {"ok": True})
+            elif self.path == "/control/watch":
+                cfg = dict(CONTROL_DEFAULTS, **self._body())
+                ok = CONTROL.start_watch(cfg)
+                self._json(200, {"ok": ok})
+            elif self.path == "/control/unwatch":
+                CONTROL.stop_watch()
+                HUB.publish({"channel": "control", "type": "log", "level": "info",
+                             "message": "Stopped watching coil status."})
                 self._json(200, {"ok": True})
             elif self.path == "/control/coil":
                 body = self._body()
@@ -1029,6 +1231,21 @@ PAGE = r"""<!DOCTYPE html>
   .coil .mini button{flex:1;padding:5px 0;font-size:12px;border-radius:6px;border:1px solid var(--line);
     background:var(--bg);color:var(--text);cursor:pointer;font-weight:600}
   .coil .mini button:hover{border-color:var(--accent2)}
+  .coil{position:relative}
+  .coil .cd{position:absolute;top:6px;right:8px;font-size:11px;font-weight:700;font-family:var(--mono);
+    color:var(--warn);display:none}
+  .coil.counting .cd{display:block}
+  .coil.counting{border-color:var(--warn)}
+  .watchflag{font-size:11px;color:var(--muted);margin:4px 0 2px}
+  .watchflag b{color:var(--ok)}
+  .timer{display:flex;align-items:center;gap:12px;background:var(--panel2);border:1px solid var(--warn);
+    border-radius:9px;padding:10px 14px;margin-bottom:12px}
+  .timer .big{font-size:26px;font-weight:700;font-family:var(--mono);color:var(--warn);min-width:74px}
+  .timer .txt{flex:1}
+  .timer .txt .t1{font-weight:600}
+  .timer .txt .t2{font-size:12px;color:var(--muted)}
+  .timer .ring{height:8px;border-radius:5px;background:#30363d;overflow:hidden;margin-top:6px}
+  .timer .ring > div{height:100%;background:var(--warn);transition:width .2s;width:100%}
   .meta{display:flex;justify-content:space-between;color:var(--muted);font-size:12px;margin-bottom:12px;font-family:var(--mono)}
   .log{height:240px;overflow:auto;background:var(--bg);border:1px solid var(--line);border-radius:9px;
     padding:10px;font-family:var(--mono);font-size:12px;line-height:1.55}
@@ -1058,6 +1275,22 @@ PAGE = r"""<!DOCTYPE html>
   .slave.other{border-color:var(--warn);color:var(--warn)}
   .slave .mm{display:block;font-size:10px;font-weight:600;color:var(--accent2);margin-top:3px;line-height:1.25;
     white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .modal{position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;
+    justify-content:center;z-index:100;padding:20px}
+  .modal-box{background:var(--panel);border:1px solid var(--line);border-radius:12px;width:min(560px,100%);
+    max-height:80vh;display:flex;flex-direction:column;overflow:hidden}
+  .modal-head{display:flex;align-items:center;justify-content:space-between;padding:14px 18px;
+    border-bottom:1px solid var(--line);font-weight:600}
+  .modal-head button{background:var(--panel2);border:1px solid var(--line);color:var(--text);
+    border-radius:7px;width:30px;height:30px;cursor:pointer;font-size:15px}
+  .modal-body{padding:14px 18px;overflow:auto}
+  .hsum{color:var(--muted);font-size:12px;margin-bottom:12px}
+  table.htab{width:100%;border-collapse:collapse;font-size:13px}
+  table.htab th{text-align:left;color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase;
+    letter-spacing:.5px;padding:6px 8px;border-bottom:1px solid var(--line)}
+  table.htab td{padding:7px 8px;border-bottom:1px solid var(--line);font-family:var(--mono)}
+  .pill{padding:2px 9px;border-radius:999px;font-size:11px;font-weight:700}
+  .pill.on{background:#11301d;color:var(--ok)} .pill.off{background:#30363d;color:var(--muted)}
 </style>
 </head>
 <body>
@@ -1131,10 +1364,29 @@ PAGE = r"""<!DOCTYPE html>
     </div>
     <div class="hint">Connect once, then fire coils. <b>Pulse</b> turns a coil ON,
       waits the pulse time, then OFF — like the original script.</div>
+
+    <h2 style="margin-top:18px">Coil Status Watch (FC01)</h2>
+    <div class="row">
+      <div class="field"><label>Start coil</label><input id="c_watch_start"></div>
+      <div class="field"><label># Coils</label><input id="c_watch_count"></div>
+    </div>
+    <div class="field"><label>Poll interval (s)</label><input id="c_watch_interval"></div>
+    <div class="btns">
+      <button class="act" id="c_watch" onclick="controlWatch()" disabled data-cdis>👁 Watch</button>
+      <button class="act" id="c_unwatch" onclick="controlUnwatch()" disabled>■ Stop watch</button>
+    </div>
+    <div class="hint">Reads live coil states (FC01) so the bank lights reflect the
+      device's real status. Auto-starts on Connect. Click a coil's name to see its
+      last 30 min of state changes.</div>
   </section>
   <section>
     <div class="panel">
       <h2>Fire a Coil</h2>
+      <div id="c_timer" class="timer" style="display:none">
+        <div class="big" id="c_timer_num">—</div>
+        <div class="txt"><div class="t1" id="c_timer_t1">—</div><div class="t2" id="c_timer_t2"></div>
+          <div class="ring"><div id="c_timer_ring"></div></div></div>
+      </div>
       <div class="row" style="align-items:flex-end">
         <div class="field" style="flex:0 0 130px"><label>Coil index</label>
           <input id="c_coil" value="0"></div>
@@ -1144,7 +1396,7 @@ PAGE = r"""<!DOCTYPE html>
           <button class="act fire" onclick="coil('fire')" disabled data-cdis>⚡ Pulse</button>
         </div>
       </div>
-      <h2 style="margin-top:6px">Coil Bank (0–15)</h2>
+      <div class="watchflag" id="c_watchflag">Coil watch: <b>off</b></div>
       <div id="c_bank" class="grid"></div>
     </div>
     <div class="panel"><h2>Command Log</h2><div id="c_log" class="log"></div></div>
@@ -1207,13 +1459,22 @@ PAGE = r"""<!DOCTYPE html>
   </section>
 </main>
 
+<div id="histModal" class="modal" style="display:none" onclick="closeHistory(event)">
+  <div class="modal-box">
+    <div class="modal-head"><span id="hist_title">Coil history</span>
+      <button onclick="closeHistory(true)" title="Close">✕</button></div>
+    <div id="hist_body" class="modal-body"></div>
+  </div>
+</div>
+
 <script>
 const $ = id => document.getElementById(id);
 let es = null;
 
 // ---- field maps (server key -> input id) ----
 const M = ["target_ip","target_port","slave_id","register_addr","num_registers","interval","timeout"];
-const C = ["target_ip","target_port","slave_id","timeout","pulse"];
+const C = ["target_ip","target_port","slave_id","timeout","pulse",
+           "watch_start","watch_count","watch_interval"];
 const S = ["net_base","net_start","net_end","net_port","net_timeout",
            "dev_ip","dev_port","dev_register","dev_slave_start","dev_slave_end","dev_timeout"];
 
@@ -1278,12 +1539,20 @@ async function monitorStop(){ try{ await fetch("/monitor/stop",{method:"POST"});
 function controlBtns(connected){
   $("c_connect").disabled=connected; $("c_disconnect").disabled=!connected;
   document.querySelectorAll("[data-cdis]").forEach(b=>b.disabled=!connected);
+  if(!connected) watchBtns(false);
+}
+function watchBtns(watching){
+  $("c_watch").disabled=watching || $("c_connect").disabled===false;
+  $("c_unwatch").disabled=!watching;
+  $("c_watchflag").innerHTML="Coil watch: <b>"+(watching?"on":"off")+"</b>";
 }
 function buildBank(){
   const bank=$("c_bank"); bank.innerHTML="";
   for(let i=0;i<16;i++){
     const c=document.createElement("div"); c.className="coil"; c.id="coil"+i;
-    c.innerHTML='<div class="cidx">Coil '+i+'</div><div class="light"></div>'+
+    c.innerHTML='<div class="cidx" style="cursor:pointer" title="Click for 30-min history" '+
+      'onclick="showHistory('+i+')">Coil '+i+' &#128203;</div>'+
+      '<div class="cd" id="cd'+i+'"></div><div class="light"></div>'+
       '<div class="mini"><button onclick="bankCoil('+i+',\'on\')">ON</button>'+
       '<button onclick="bankCoil('+i+',\'off\')">OFF</button>'+
       '<button onclick="bankCoil('+i+',\'fire\')">⚡</button></div>';
@@ -1291,6 +1560,29 @@ function buildBank(){
   }
 }
 function setCoilLight(coil, on){ const c=$("coil"+coil); if(c) c.classList.toggle("on", !!on); }
+function setCoilCountdown(coil, remaining, done){
+  const c=$("coil"+coil), cd=$("cd"+coil); if(!c||!cd) return;
+  if(done){ c.classList.remove("counting"); cd.textContent=""; }
+  else { c.classList.add("counting"); cd.textContent=remaining.toFixed(1)+"s"; }
+}
+let timerCoils={};
+function updateTimer(coil, remaining, total, done){
+  if(done){ delete timerCoils[coil]; }
+  else { timerCoils[coil]={remaining:remaining, total:total}; }
+  const keys=Object.keys(timerCoils);
+  const box=$("c_timer");
+  if(!keys.length){ box.style.display="none"; return; }
+  // Show the coil with the least time remaining.
+  let show=keys[0];
+  keys.forEach(k=>{ if(timerCoils[k].remaining < timerCoils[show].remaining) show=k; });
+  const t=timerCoils[show];
+  box.style.display="flex";
+  $("c_timer_num").textContent=t.remaining.toFixed(1)+"s";
+  $("c_timer_t1").textContent="⚡ Coil "+show+" is ON";
+  $("c_timer_t2").textContent="turns OFF in "+t.remaining.toFixed(1)+" s"+
+    (keys.length>1?("  (+"+(keys.length-1)+" more pulsing)"):"");
+  $("c_timer_ring").style.width=(t.total>0?Math.max(0,Math.min(100,t.remaining/t.total*100)):0)+"%";
+}
 async function sendCoil(coil, action){
   try{ await fetch("/control/coil",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify({coil:coil, action:action, pulse:$("c_pulse").value})}); }
@@ -1305,6 +1597,53 @@ async function controlConnect(){
   catch(e){ addLog("c_log","error","Connect request failed: "+e); }
 }
 async function controlDisconnect(){ try{ await fetch("/control/disconnect",{method:"POST"}); }catch(e){} }
+async function controlWatch(){
+  try{ await fetch("/control/watch",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify(gather("c_",C))}); }catch(e){ addLog("c_log","error","Watch failed: "+e); }
+}
+async function controlUnwatch(){ try{ await fetch("/control/unwatch",{method:"POST"}); }catch(e){} }
+
+// ---- per-coil 30-minute history ----
+function fullTime(ts){ const d=new Date(ts*1000);
+  return pad(d.getHours())+":"+pad(d.getMinutes())+":"+pad(d.getSeconds()); }
+function dur(sec){ sec=Math.max(0,sec);
+  if(sec<60) return sec.toFixed(1)+"s";
+  const m=Math.floor(sec/60), s=Math.round(sec%60); return m+"m "+(s<10?"0":"")+s+"s"; }
+async function showHistory(coil){
+  $("hist_title").textContent="Coil "+coil+" — last 30 min";
+  $("hist_body").innerHTML='<div class="empty">Loading…</div>';
+  $("histModal").style.display="flex";
+  try{
+    const j=await (await fetch("/control/history?coil="+coil)).json();
+    renderHistory(coil, j);
+  }catch(e){ $("hist_body").innerHTML='<div class="empty">Failed to load history.</div>'; }
+}
+function closeHistory(ev){
+  if(ev===true || (ev && ev.target && ev.target.id==="histModal")) $("histModal").style.display="none";
+}
+function renderHistory(coil, j){
+  const now=j.now, entries=j.entries||[];
+  if(!entries.length){
+    $("hist_body").innerHTML='<div class="empty">No recorded changes in the last 30 min.<br>'+
+      'Connect and <b>Watch</b> (or fire this coil) to build history.</div>'; return;
+  }
+  let onTime=0, onCount=0;
+  for(let i=0;i<entries.length;i++){
+    const endTs=(i<entries.length-1)?entries[i+1].ts:now;
+    if(entries[i].state){ onCount++; onTime+=endTs-entries[i].ts; }
+  }
+  let html='<div class="hsum">'+entries.length+' change(s) · '+onCount+' ON period(s) · total ON '+
+    dur(onTime)+'</div>';
+  html+='<table class="htab"><thead><tr><th>Time</th><th>State</th><th>Held for</th></tr></thead><tbody>';
+  for(let i=entries.length-1;i>=0;i--){
+    const e=entries[i], endTs=(i<entries.length-1)?entries[i+1].ts:now, held=endTs-e.ts;
+    html+='<tr><td>'+fullTime(e.ts)+'</td><td><span class="pill '+(e.state?'on':'off')+'">'+
+      (e.state?'ON':'OFF')+'</span></td><td>'+dur(held)+(i===entries.length-1?' <span style="color:var(--muted)">(current)</span>':'')+'</td></tr>';
+  }
+  html+='</tbody></table>';
+  $("hist_body").innerHTML=html;
+}
+window.addEventListener("keydown", e=>{ if(e.key==="Escape") closeHistory(true); });
 
 // ---------------- SCAN ----------------
 function scanRunning(running){ $("s_net_btn").disabled=running; $("s_dev_btn").disabled=running; }
@@ -1365,6 +1704,14 @@ function handle(ev){
       if(ev.state!=="idle") addLog("c_log",ev.state==="error"?"error":"info",ev.message,ev.ts); }
     else if(ev.type==="log") addLog("c_log",ev.level||"info",ev.message,ev.ts);
     else if(ev.type==="coil") setCoilLight(ev.coil, ev.state);
+    else if(ev.type==="coil_status"){
+      for(let i=0;i<ev.states.length;i++) setCoilLight(ev.start+i, ev.states[i]);
+    }
+    else if(ev.type==="countdown"){
+      setCoilCountdown(ev.coil, ev.remaining, ev.done);
+      updateTimer(ev.coil, ev.remaining, ev.total, ev.done);
+    }
+    else if(ev.type==="watch"){ watchBtns(!!ev.watching); }
   } else if(ch==="scan"){
     if(ev.type==="scan_status"){ updateBadge("scan",ev.state,ev.message); scanRunning(ev.state==="running");
       const p=ev.kind==="device"?"s_dev_prog":"s_net_prog"; $(p).textContent=ev.message; }
@@ -1417,7 +1764,8 @@ window.addEventListener("load", async ()=>{
   // 3) live state
   if(cfg){
     if(cfg.monitor.running){ updateBadge("monitor","running","Polling"); monitorBtns(true); }
-    if(cfg.control.connected){ updateBadge("control","running","Connected"); controlBtns(true); }
+    if(cfg.control.connected){ updateBadge("control","running","Connected"); controlBtns(true);
+      watchBtns(!!cfg.control.watching); }
   }
   document.querySelectorAll("input").forEach(i=>i.addEventListener("change",saveAll));
   connectStream();

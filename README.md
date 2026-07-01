@@ -68,7 +68,15 @@ Switch between pages with the tabs in the header.
    **Pulse** duration, then **Connect**.
 2. Fire a coil by index with **ON** / **OFF** / **⚡ Pulse**, or use the 16-coil
    quick bank. Pulse turns the coil ON, waits, then OFF — like the original
-   script's 5-second cycle. Coil indicators light up green when ON.
+   script's 5-second cycle, with a **live countdown** shown on the coil and in a
+   timer banner.
+3. **Coil status watch** — on Connect, ModFire polls live coil states with
+   **FC01 (Read Coils)** so the bank lights reflect the device's *actual* status,
+   not just what was commanded. Adjust the range/interval and toggle it with
+   **Watch** / **Stop watch**.
+4. **30-minute history** — every coil's ON/OFF changes are logged for the last
+   30 minutes. **Click a coil's name** in the bank to open its timeline (each
+   state, when it changed, and how long it was held, plus total ON time).
 
 ### Scan
 - **Find gateways** — enter a subnet (first three octets) and host range; it
