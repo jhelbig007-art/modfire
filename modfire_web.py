@@ -57,7 +57,8 @@ CONTROL_DEFAULTS = {
     "watch_start": 0,
     "watch_count": 16,
     "watch_interval": 1.0,
-    "stale_threshold": 10.0,
+    "stale_on_threshold": 10.0,
+    "stale_off_threshold": 10.0,
 }
 
 SCAN_DEFAULTS = {
@@ -1247,6 +1248,8 @@ PAGE = r"""<!DOCTYPE html>
   .stale-badge{display:none;font-size:10px;font-weight:700;color:var(--err);margin-top:6px;
     white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .coil.stale .stale-badge{display:block}
+  .state-time{font-size:11px;font-family:var(--mono);color:var(--muted);margin-top:6px}
+  .state-time.on{color:var(--ok)}
   .watchflag{font-size:11px;color:var(--muted);margin:4px 0 2px}
   .watchflag b{color:var(--ok)}
   .timer{display:flex;align-items:center;gap:12px;background:var(--panel2);border:1px solid var(--warn);
@@ -1386,15 +1389,21 @@ PAGE = r"""<!DOCTYPE html>
       <button class="act" id="c_watch" onclick="controlWatch()" disabled data-cdis>👁 Watch</button>
       <button class="act" id="c_unwatch" onclick="controlUnwatch()" disabled>■ Stop watch</button>
     </div>
-    <div class="field" style="margin-top:12px">
-      <label>Flag if last ON period was shorter than (s)</label>
-      <input id="c_stale_threshold">
+    <div class="row" style="margin-top:12px">
+      <div class="field"><label>Flag if last ON was shorter than (s)</label>
+        <input id="c_stale_on_threshold"></div>
+      <div class="field"><label>Flag if last OFF was shorter than (s)</label>
+        <input id="c_stale_off_threshold"></div>
     </div>
-    <div class="hint">If a coil's most recent ON period lasted <i>less</i> than this
-      many seconds before turning OFF, it's highlighted <span style="color:var(--err);font-weight:600">red</span>
-      as a possible short/failed cycle — e.g. a coil meant to hold for 30s that
-      only stayed on for 10s. The flag clears once a subsequent ON period lasts
-      long enough. <b># Coils</b> sets how many coils appear in the bank
+    <div class="hint">If a coil's most recent completed ON period was shorter than
+      the ON threshold (while it's currently OFF), or its most recent completed
+      OFF period was shorter than the OFF threshold (while it's currently ON),
+      it's highlighted <span style="color:var(--err);font-weight:600">red</span>
+      with the duration — e.g. a coil meant to hold ON for 30s that only stayed
+      on 10s, or one that's flapping back ON too soon after being OFF. The flag
+      clears once the relevant period lasts long enough. Each coil also shows a
+      live <b>ON/OFF</b> timer for its current state. <b># Coils</b> sets how
+      many coils appear in the bank
       (starting at <b>Start coil</b>) and, once watching, reads their live status
       via FC01 so the lights reflect the device's real state. Change either field
       and the bank resizes immediately — no need to reconnect. Click a coil's
@@ -1498,7 +1507,8 @@ let es = null;
 // ---- field maps (server key -> input id) ----
 const M = ["target_ip","target_port","slave_id","register_addr","num_registers","interval","timeout"];
 const C = ["target_ip","target_port","slave_id","timeout","pulse",
-           "watch_start","watch_count","watch_interval","stale_threshold"];
+           "watch_start","watch_count","watch_interval",
+           "stale_on_threshold","stale_off_threshold"];
 const S = ["net_base","net_start","net_end","net_port","net_timeout",
            "dev_ip","dev_port","dev_register","dev_slave_start","dev_slave_end","dev_timeout"];
 
@@ -1601,6 +1611,7 @@ function buildBank(){
     c.innerHTML='<div class="cidx" style="cursor:pointer" title="Click for 30-min history" '+
       'onclick="showHistory('+i+')">Coil '+i+' &#128203;</div>'+
       '<div class="cd" id="cd'+i+'"></div><div class="light"></div>'+
+      '<div class="state-time" id="st'+i+'">—</div>'+
       '<div class="stale-badge" id="stale'+i+'"></div>'+
       '<div class="mini"><button onclick="bankCoil('+i+',\'on\')">ON</button>'+
       '<button onclick="bankCoil('+i+',\'off\')">OFF</button>'+
@@ -1610,10 +1621,11 @@ function buildBank(){
   $("c_bank_range").textContent="Coils "+start+"–"+(start+capped-1);
   $("c_bank_note").textContent=(count>capped)?("showing first "+capped+" of "+count+" watched"):"";
 }
-// ---- short-cycle flagging: was the coil's LAST completed ON period ----
-// ---- shorter than the configured threshold? ----
-let coilKnown={};       // coil -> {state, since}  (current known state + when it started)
-let lastOnDuration={};  // coil -> seconds the most recent completed ON period lasted
+// ---- short-cycle flagging: was the coil's LAST completed ON (or OFF) ----
+// ---- period shorter than the configured threshold? ----
+let coilKnown={};        // coil -> {state, since}  (current known state + when it started)
+let lastOnDuration={};   // coil -> seconds the most recent completed ON period lasted
+let lastOffDuration={};  // coil -> seconds the most recent completed OFF period lasted
 function setCoilLight(coil, on, ts){
   const c=$("coil"+coil); if(c) c.classList.toggle("on", !!on);
   ts = ts || nowSec();
@@ -1623,24 +1635,49 @@ function setCoilLight(coil, on, ts){
   if(prev.state === on){ return; }  // no transition, leave "since" alone
   if(prev.state === true && on === false){
     lastOnDuration[coil] = Math.max(0, ts - prev.since);
+  } else if(prev.state === false && on === true){
+    lastOffDuration[coil] = Math.max(0, ts - prev.since);
   }
   coilKnown[coil] = {state:on, since:ts};
 }
-function updateStaleness(){
-  const thr=parseFloat($("c_stale_threshold").value);
-  const threshold=(isNaN(thr)||thr<=0)?null:thr;
+function parsePositive(id){
+  const v=parseFloat($(id).value);
+  return (isNaN(v)||v<=0)?null:v;
+}
+function updateCoilVisuals(){
+  const onThr=parsePositive("c_stale_on_threshold");
+  const offThr=parsePositive("c_stale_off_threshold");
   for(let n=0;n<bankCount;n++){
-    const coil=bankStart+n, el=$("coil"+coil), badge=$("stale"+coil);
+    const coil=bankStart+n, el=$("coil"+coil), badge=$("stale"+coil), timeEl=$("st"+coil);
     if(!el) continue;
+    const known=coilKnown[coil];
     const isOn=el.classList.contains("on");
-    const d=lastOnDuration[coil];
-    if(isOn || threshold===null || d===undefined){
-      el.classList.remove("stale"); if(badge) badge.textContent=""; continue;
+
+    // Live "time in current state" readout.
+    if(timeEl){
+      if(known===undefined){ timeEl.textContent="—"; timeEl.className="state-time"; }
+      else {
+        timeEl.textContent=(known.state?"ON ":"OFF ")+dur(nowSec()-known.since);
+        timeEl.className="state-time"+(known.state?" on":"");
+      }
     }
-    if(d < threshold){
-      el.classList.add("stale");
-      if(badge) badge.textContent="⚠ last ON only "+dur(d)+" (< "+dur(threshold)+")";
-    } else { el.classList.remove("stale"); if(badge) badge.textContent=""; }
+
+    // Short-cycle red flag: while OFF, judge the last ON period; while ON,
+    // judge the last OFF period (i.e. did it come back on too soon?).
+    let flagged=false, text="";
+    if(isOn){
+      const d=lastOffDuration[coil];
+      if(offThr!==null && d!==undefined && d<offThr){
+        flagged=true; text="⚠ last OFF only "+dur(d)+" (< "+dur(offThr)+")";
+      }
+    } else {
+      const d=lastOnDuration[coil];
+      if(onThr!==null && d!==undefined && d<onThr){
+        flagged=true; text="⚠ last ON only "+dur(d)+" (< "+dur(onThr)+")";
+      }
+    }
+    el.classList.toggle("stale", flagged);
+    if(badge) badge.textContent=flagged?text:"";
   }
 }
 function setCoilCountdown(coil, remaining, done){
@@ -1860,7 +1897,7 @@ window.addEventListener("load", async ()=>{
   $("c_watch_start").addEventListener("input", buildBank);
   $("c_watch_count").addEventListener("input", buildBank);
   connectStream();
-  setInterval(()=>{ renderStateTime(); updateStaleness(); }, 1000);
+  setInterval(()=>{ renderStateTime(); updateCoilVisuals(); }, 1000);
 });
 </script>
 </body>

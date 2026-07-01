@@ -83,13 +83,19 @@ Switch between pages with the tabs in the header.
 5. **30-minute history** — every coil's ON/OFF changes are logged for the last
    30 minutes. **Click a coil's name** in the bank to open its timeline (each
    state, when it changed, and how long it was held, plus total ON time).
-6. **Short-cycle flag** — set **Flag if last ON period was shorter than (s)**
-   (default 10s). If a coil's most recent completed ON period lasted *less*
-   than that many seconds before turning OFF, the coil is highlighted **red**
-   with a badge showing how short it was — e.g. a coil meant to hold for 30s
-   that only stayed on for 10s (a possible short/failed cycle). A coil currently
-   ON is never flagged; the flag clears as soon as a later ON period lasts long
-   enough. Works for both manual ON/OFF and Pulse.
+6. **Short-cycle flags (ON and OFF)** — two thresholds, both default 10s:
+   - **Flag if last ON was shorter than (s)** — while a coil is currently OFF,
+     if its most recent completed ON period lasted less than this, it's
+     highlighted **red** (e.g. meant to hold 30s, only stayed on 10s).
+   - **Flag if last OFF was shorter than (s)** — while a coil is currently ON,
+     if its most recent completed OFF period was shorter than this, it's
+     flagged **red** too (e.g. it flapped back ON too soon after being OFF).
+
+   Only one applies at a time (whichever matches the coil's *current* state),
+   with a badge showing the actual duration. The flag clears as soon as the
+   relevant period lasts long enough. Works for both manual ON/OFF and Pulse.
+7. **Live state timer** — every coil in the bank shows how long it's been in
+   its current state (e.g. `ON 12s` or `OFF 3m45s`), ticking live.
 
 The header badge next to each page's status also shows how long it's been in
 that state (e.g. "Connected · 4m12s"), updating live.
