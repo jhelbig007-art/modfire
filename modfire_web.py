@@ -4,7 +4,7 @@ modfire_web.py — Single-file local web app for Modbus TCP.
 
 Run it:
     python3 modfire_web.py
-Then open the URL it prints (default http://127.0.0.1:8512) in your browser.
+Then open the URL it prints (default http://127.0.0.1:8080) in your browser.
 
 It serves a self-contained, multi-page web UI (HTML/CSS/JS embedded below):
 
@@ -32,7 +32,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 # Bind to all interfaces so the page is reachable from other devices on the LAN
 # (e.g. a tablet or another PC). Set to "127.0.0.1" to restrict to this machine.
 HOST = "0.0.0.0"
-PORT = 8512
+PORT = 8080
 
 # Filled in at startup with this PC's reachable IP addresses (for display).
 SERVER_INFO = {"ips": [], "port": PORT}

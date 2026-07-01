@@ -30,8 +30,8 @@ this machine and from other devices on the network, for example:
 
 ```
   Open one of these in your browser:
-    • On this PC:        http://127.0.0.1:8512
-    • On the network:    http://192.168.23.50:8512
+    • On this PC:        http://127.0.0.1:8080
+    • On the network:    http://192.168.23.50:8080
 ```
 
 The same address is shown in the top-right of the web page (🖥 This PC: …).
@@ -46,7 +46,7 @@ Windows **"allow changes?"** prompt to let other devices connect. If you skip it
 Administrator:
 
 ```
-netsh advfirewall firewall add rule name="ModFire Modbus Console" dir=in action=allow protocol=TCP localport=8512
+netsh advfirewall firewall add rule name="ModFire Modbus Console" dir=in action=allow protocol=TCP localport=8080
 ```
 
 To keep the page private to this machine only, set `HOST = "127.0.0.1"` near the
