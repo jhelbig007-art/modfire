@@ -46,11 +46,42 @@ Windows **"allow changes?"** prompt to let other devices connect. If you skip it
 Administrator:
 
 ```
-netsh advfirewall firewall add rule name="ModFire Modbus Console" dir=in action=allow protocol=TCP localport=8080
+netsh advfirewall firewall add rule name="ModFire Modbus Console (8080)" dir=in action=allow protocol=TCP localport=8080
 ```
+
+The rule name includes the port number, so if you change `PORT` later a fresh
+rule gets created automatically rather than being silently skipped because an
+old rule (for a previous port) already existed under the same name.
 
 To keep the page private to this machine only, set `HOST = "127.0.0.1"` near the
 top of `modfire_web.py` (no firewall rule needed then).
+
+#### Still can't reach it from another device?
+
+1. **Confirm the rule is actually for this port.** `netsh advfirewall firewall
+   show rule name=all | findstr /I modfire` (or check Windows Defender
+   Firewall → Advanced Settings → Inbound Rules) — you should see "ModFire
+   Modbus Console (8080)", enabled, TCP, with `LocalPort 8080`. Delete any
+   older rule for a different port; it's just clutter, not a blocker.
+2. **Test from the server PC itself first**, using its LAN IP (not
+   `127.0.0.1`) — e.g. `http://192.168.x.x:8080` in a browser on the same
+   machine. If that fails too, it's not the *other* device or the network,
+   it's this machine's firewall/binding — re-run the firewall prompt or add
+   the rule manually.
+3. **Check for a second firewall.** Third-party antivirus/security suites
+   (Norton, McAfee, Kaspersky, etc.) often run their own firewall on top of
+   Windows Firewall and need the port allowed separately.
+4. **Check the network profile.** If Windows treats the connection as
+   "Public" rather than "Private", some setups restrict inbound traffic more
+   aggressively — Settings → Network & Internet → confirm the active network
+   type, and consider switching it to Private.
+5. **Router/AP client isolation.** Some home and most guest Wi-Fi networks
+   block devices from talking to each other even on the same SSID. Try both
+   devices on Ethernet, or check your router's Wi-Fi settings for "AP/client
+   isolation" and disable it.
+6. **Make sure both devices are actually on the same subnet** (e.g. both
+   `192.168.1.x`, not one on `192.168.1.x` and the other on a guest network
+   like `192.168.2.x`).
 
 ## Use it
 

@@ -1936,7 +1936,10 @@ def ensure_windows_firewall(port):
     other platforms (their firewalls, if any, are handled differently)."""
     if platform.system() != "Windows":
         return
-    rule = "ModFire Modbus Console"
+    # The rule name includes the port so switching ports (via PORT above)
+    # always gets its own rule, instead of being masked by a stale rule
+    # left over from a previous port.
+    rule = f"ModFire Modbus Console ({port})"
     try:
         out = subprocess.run(
             ["netsh", "advfirewall", "firewall", "show", "rule", f"name={rule}"],
